@@ -1,0 +1,38 @@
+name: Build TapeStop Pro VST
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Clone JUCE
+        run: git clone --depth 1 --branch 7.0.9 https://github.com/juce-framework/JUCE.git ../JUCE
+
+      - name: Configure CMake
+        run: |
+          cmake -B build -G "Visual Studio 17 2022" -A x64 `
+                -DJUCE_PATH="${{ github.workspace }}/../JUCE" `
+                -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Upload VST3
+        uses: actions/upload-artifact@v4
+        with:
+          name: TapeStopPro-VST3-Windows
+          path: build/TapeStopPro_artefacts/Release/VST3/
+
+      - name: Upload VST2
+        uses: actions/upload-artifact@v4
+        with:
+          name: TapeStopPro-VST2-Windows
+          path: build/TapeStopPro_artefacts/Release/VST/
