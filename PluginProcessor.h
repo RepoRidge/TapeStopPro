@@ -31,12 +31,10 @@ public:
 
     void parameterChanged(const juce::String& paramID, float newValue) override;
 
-    // Called from editor to trigger stop/start
     void triggerStop();
     void triggerStart();
-    void triggerStopStart(); // combined: stop then auto-start
+    void triggerStopStart();
 
-    // State for UI
     enum class TapeState { Idle, Stopping, Stopped, Starting };
     TapeState getTapeState() const { return tapeState.load(); }
     float getCurrentSpeed() const { return currentSpeed.load(); }
@@ -46,14 +44,12 @@ public:
 private:
     juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
 
-    // Circular buffer for pitch/speed manipulation
-    static constexpr int BUFFER_SIZE = 1 << 20; // ~1M samples
+    static constexpr int BUFFER_SIZE = 1 << 20;
     std::vector<float> circularBufferL, circularBufferR;
     double writePos = 0.0;
     double readPos  = 0.0;
     int    bufferMask = BUFFER_SIZE - 1;
 
-    // Speed ramp state
     std::atomic<TapeState> tapeState { TapeState::Idle };
     std::atomic<float> currentSpeed { 1.0f };
 
@@ -61,9 +57,11 @@ private:
     double stopTimeSamples  = 44100.0;
     double startTimeSamples = 44100.0;
 
-    double rampProgress = 0.0; // 0..1 during ramp
+    double rampProgress = 0.0;
 
-    // Interpolation helpers
+    // Per l'automazione del TAP
+    float lastTapValue = 0.0f;
+
     float interpolateSample(const std::vector<float>& buf, double pos);
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(TapeStopAudioProcessor)
