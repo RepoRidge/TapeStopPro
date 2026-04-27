@@ -1,422 +1,213 @@
-#include "PluginEditor.h"
 #include "PluginProcessor.h"
+#include "PluginEditor.h"
 
-// ═══════════════════════════════════════════════════════════════════
-//  Colour palette
-// ═══════════════════════════════════════════════════════════════════
-namespace Pal
+TapeStopAudioProcessor::TapeStopAudioProcessor()
+    : AudioProcessor(BusesProperties()
+          .withInput ("Input",  juce::AudioChannelSet::stereo(), true)
+          .withOutput("Output", juce::AudioChannelSet::stereo(), true)),
+      apvts(*this, nullptr, "Parameters", createParameterLayout())
 {
-    const juce::Colour bg        { 0xFF111318 };
-    const juce::Colour panel     { 0xFF1A1E27 };
-    const juce::Colour border    { 0xFF2C3040 };
-    const juce::Colour knobBg    { 0xFF22273A };
-    const juce::Colour knobRim   { 0xFF3A4060 };
-    const juce::Colour accent    { 0xFFE8A835 };   // warm amber
-    const juce::Colour accentDim { 0xFF9A6E1A };
-    const juce::Colour red       { 0xFFE84040 };
-    const juce::Colour green     { 0xFF40D080 };
-    const juce::Colour textBright{ 0xFFF0EEE8 };
-    const juce::Colour textDim   { 0xFF6A7090 };
-    const juce::Colour reel1     { 0xFF2A2E3E };
-    const juce::Colour reel2     { 0xFF1A1D28 };
-    const juce::Colour reelSpoke { 0xFF3A4060 };
-    const juce::Colour tape      { 0xFF8B6A2A };
+    circularBufferL.resize(BUFFER_SIZE, 0.0f);
+    circularBufferR.resize(BUFFER_SIZE, 0.0f);
+
+    apvts.addParameterListener("stopTime",  this);
+    apvts.addParameterListener("startTime", this);
+    apvts.addParameterListener("tap",       this);
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  Custom LookAndFeel for knobs
-// ═══════════════════════════════════════════════════════════════════
-class TapeLookAndFeel : public juce::LookAndFeel_V4
+TapeStopAudioProcessor::~TapeStopAudioProcessor()
 {
-public:
-    TapeLookAndFeel()
+    apvts.removeParameterListener("stopTime",  this);
+    apvts.removeParameterListener("startTime", this);
+    apvts.removeParameterListener("tap",       this);
+}
+
+juce::AudioProcessorValueTreeState::ParameterLayout TapeStopAudioProcessor::createParameterLayout()
+{
+    juce::AudioProcessorValueTreeState::ParameterLayout layout;
+
+    layout.add(std::make_unique<juce::AudioParameterFloat>(
+        "stopTime", "Stop Time",
+        juce::NormalisableRange<float>(10.0f, 5000.0f, 1.0f, 0.4f),
+        500.0f, "ms"));
+
+    layout.add(std::make_unique<juce::AudioParameterFloat>(
+        "startTime", "Start Time",
+        juce::NormalisableRange<float>(10.0f, 5000.0f, 1.0f, 0.4f),
+        500.0f, "ms"));
+
+    // Tap come parametro 0/1 automatizzabile
+    layout.add(std::make_unique<juce::AudioParameterFloat>(
+        "tap", "Tap",
+        juce::NormalisableRange<float>(0.0f, 1.0f, 1.0f),
+        0.0f));
+
+    return layout;
+}
+
+void TapeStopAudioProcessor::parameterChanged(const juce::String& paramID, float newValue)
+{
+    if (paramID == "stopTime")
+        stopTimeSamples = (newValue / 1000.0) * sampleRate_;
+    else if (paramID == "startTime")
+        startTimeSamples = (newValue / 1000.0) * sampleRate_;
+    else if (paramID == "tap")
     {
-        setColour(juce::Slider::thumbColourId,          Pal::accent);
-        setColour(juce::Slider::rotarySliderFillColourId, Pal::accent);
-        setColour(juce::Slider::rotarySliderOutlineColourId, Pal::knobRim);
-        setColour(juce::Label::textColourId,            Pal::textDim);
+        // Scatta solo sul fronte di salita (0→1), non mentre rimane a 1
+        if (newValue >= 0.5f && lastTapValue < 0.5f)
+            triggerStopStart();
+        lastTapValue = newValue;
     }
+}
 
-    void drawRotarySlider(juce::Graphics& g, int x, int y, int width, int height,
-                          float sliderPosProportional, float rotaryStartAngle,
-                          float rotaryEndAngle, juce::Slider&) override
+void TapeStopAudioProcessor::prepareToPlay(double sampleRate, int /*samplesPerBlock*/)
+{
+    sampleRate_ = sampleRate;
+    stopTimeSamples  = (apvts.getRawParameterValue("stopTime")->load()  / 1000.0) * sampleRate;
+    startTimeSamples = (apvts.getRawParameterValue("startTime")->load() / 1000.0) * sampleRate;
+
+    std::fill(circularBufferL.begin(), circularBufferL.end(), 0.0f);
+    std::fill(circularBufferR.begin(), circularBufferR.end(), 0.0f);
+    writePos = 0.0;
+    readPos  = 0.0;
+    currentSpeed.store(1.0f);
+    tapeState.store(TapeState::Idle);
+    rampProgress = 0.0;
+    lastTapValue = 0.0f;
+}
+
+void TapeStopAudioProcessor::releaseResources() {}
+
+void TapeStopAudioProcessor::triggerStop()
+{
+    if (tapeState.load() == TapeState::Idle)
     {
-        const float radius   = juce::jmin(width, height) * 0.5f - 4.0f;
-        const float centreX  = x + width  * 0.5f;
-        const float centreY  = y + height * 0.5f;
-        const float angle    = rotaryStartAngle + sliderPosProportional * (rotaryEndAngle - rotaryStartAngle);
+        tapeState.store(TapeState::Stopping);
+        rampProgress = 0.0;
+    }
+}
 
-        // Outer glow ring
+void TapeStopAudioProcessor::triggerStart()
+{
+    if (tapeState.load() == TapeState::Stopped)
+    {
+        tapeState.store(TapeState::Starting);
+        rampProgress = 0.0;
+    }
+}
+
+void TapeStopAudioProcessor::triggerStopStart()
+{
+    auto state = tapeState.load();
+    if (state == TapeState::Idle || state == TapeState::Starting)
+    {
+        tapeState.store(TapeState::Stopping);
+        rampProgress = 0.0;
+    }
+    else if (state == TapeState::Stopped || state == TapeState::Stopping)
+    {
+        tapeState.store(TapeState::Starting);
+        rampProgress = 0.0;
+    }
+}
+
+float TapeStopAudioProcessor::interpolateSample(const std::vector<float>& buf, double pos)
+{
+    int   i0 = (int)pos & bufferMask;
+    int   i1 = (i0 + 1) & bufferMask;
+    float t  = (float)(pos - std::floor(pos));
+    return buf[i0] * (1.0f - t) + buf[i1] * t;
+}
+
+void TapeStopAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
+{
+    const int numSamples  = buffer.getNumSamples();
+    const bool hasStereo  = buffer.getNumChannels() >= 2;
+
+    const float* inL = buffer.getReadPointer(0);
+    const float* inR = hasStereo ? buffer.getReadPointer(1) : inL;
+    float* outL = buffer.getWritePointer(0);
+    float* outR = hasStereo ? buffer.getWritePointer(1) : nullptr;
+
+    for (int i = 0; i < numSamples; ++i)
+    {
+        int wi = (int)writePos & bufferMask;
+        circularBufferL[wi] = inL[i];
+        circularBufferR[wi] = hasStereo ? inR[i] : inL[i];
+        writePos += 1.0;
+
+        auto state = tapeState.load();
+        float speed = currentSpeed.load();
+
+        if (state == TapeState::Stopping)
         {
-            juce::Path ring;
-            ring.addEllipse(centreX - radius - 4, centreY - radius - 4,
-                            (radius + 4) * 2, (radius + 4) * 2);
-            g.setColour(Pal::accentDim.withAlpha(0.15f));
-            g.fillPath(ring);
+            double totalSamples = stopTimeSamples > 0 ? stopTimeSamples : 1.0;
+            rampProgress += 1.0 / totalSamples;
+            if (rampProgress >= 1.0) rampProgress = 1.0;
+
+            float t = (float)rampProgress;
+            speed = 1.0f - (t * t * (3.0f - 2.0f * t));
+            currentSpeed.store(speed);
+
+            if (rampProgress >= 1.0)
+            {
+                tapeState.store(TapeState::Stopped);
+                speed = 0.0f;
+            }
+        }
+        else if (state == TapeState::Starting)
+        {
+            double totalSamples = startTimeSamples > 0 ? startTimeSamples : 1.0;
+            rampProgress += 1.0 / totalSamples;
+            if (rampProgress >= 1.0) rampProgress = 1.0;
+
+            float t = (float)rampProgress;
+            speed = t * t * (3.0f - 2.0f * t);
+            currentSpeed.store(speed);
+
+            if (rampProgress >= 1.0)
+            {
+                tapeState.store(TapeState::Idle);
+                speed = 1.0f;
+                currentSpeed.store(1.0f);
+                readPos = writePos;
+            }
         }
 
-        // Body gradient
-        {
-            juce::ColourGradient grad(Pal::knobBg.brighter(0.08f), centreX - radius * 0.3f,
-                                     centreY - radius * 0.3f,
-                                     Pal::reel2, centreX + radius * 0.4f,
-                                     centreY + radius * 0.4f, true);
-            g.setGradientFill(grad);
-            g.fillEllipse(centreX - radius, centreY - radius, radius * 2, radius * 2);
-        }
+        readPos += (double)speed;
 
-        // Outer rim
-        g.setColour(Pal::knobRim);
-        g.drawEllipse(centreX - radius, centreY - radius, radius * 2, radius * 2, 1.5f);
+        double maxDelay = (double)(BUFFER_SIZE / 2);
+        if (writePos - readPos > maxDelay)
+            readPos = writePos - maxDelay;
 
-        // Arc track
-        {
-            juce::Path arcTrack;
-            arcTrack.addArc(centreX - radius + 5, centreY - radius + 5,
-                            (radius - 5) * 2, (radius - 5) * 2,
-                            rotaryStartAngle, rotaryEndAngle, true);
-            g.setColour(Pal::border);
-            g.strokePath(arcTrack, juce::PathStrokeType(2.5f));
-        }
+        float sampleL = interpolateSample(circularBufferL, readPos);
+        float sampleR = interpolateSample(circularBufferR, readPos);
 
-        // Filled arc
-        {
-            juce::Path filledArc;
-            filledArc.addArc(centreX - radius + 5, centreY - radius + 5,
-                             (radius - 5) * 2, (radius - 5) * 2,
-                             rotaryStartAngle, angle, true);
-            g.setColour(Pal::accent);
-            g.strokePath(filledArc, juce::PathStrokeType(2.5f,
-                juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
-        }
-
-        // Pointer line
-        {
-            const float px = centreX + (radius - 9) * std::sin(angle);
-            const float py = centreY - (radius - 9) * std::cos(angle);
-            g.setColour(Pal::accent);
-            g.drawLine(centreX, centreY, px, py, 2.5f);
-
-            // Dot at tip
-            g.fillEllipse(px - 3, py - 3, 6, 6);
-        }
-
-        // Centre dot
-        g.setColour(Pal::border);
-        g.fillEllipse(centreX - 4, centreY - 4, 8, 8);
+        outL[i] = sampleL;
+        if (outR) outR[i] = sampleR;
     }
-};
-
-static TapeLookAndFeel& getLAF()
-{
-    static TapeLookAndFeel laf;
-    return laf;
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  ReelComponent
-// ═══════════════════════════════════════════════════════════════════
-ReelComponent::ReelComponent()
+void TapeStopAudioProcessor::getStateInformation(juce::MemoryBlock& destData)
 {
-    startTimerHz(60);
+    auto state = apvts.copyState();
+    std::unique_ptr<juce::XmlElement> xml(state.createXml());
+    copyXmlToBinary(*xml, destData);
 }
 
-void ReelComponent::setSpeed(float spd)
+void TapeStopAudioProcessor::setStateInformation(const void* data, int sizeInBytes)
 {
-    speed = spd;
+    std::unique_ptr<juce::XmlElement> xml(getXmlFromBinary(data, sizeInBytes));
+    if (xml && xml->hasTagName(apvts.state.getType()))
+        apvts.replaceState(juce::ValueTree::fromXml(*xml));
 }
 
-void ReelComponent::timerCallback()
+juce::AudioProcessorEditor* TapeStopAudioProcessor::createEditor()
 {
-    angle    += speed * 0.06f;
-    wobble   += wobbleDelta;
-    wobbleDelta = wobbleDelta * 0.95f + (juce::Random::getSystemRandom().nextFloat() - 0.5f) * 0.002f * (1.0f - speed);
-    repaint();
+    return new TapeStopAudioProcessorEditor(*this);
 }
 
-void ReelComponent::paint(juce::Graphics& g)
+juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
 {
-    const float W = (float)getWidth();
-    const float H = (float)getHeight();
-    const float cx = W * 0.5f;
-    const float cy = H * 0.5f;
-    const float R  = juce::jmin(W, H) * 0.5f - 2.0f;
-
-    // ── Outer housing ──
-    {
-        juce::ColourGradient grad(Pal::panel, cx - R * 0.5f, cy - R * 0.5f,
-                                   Pal::reel2, cx + R, cy + R, true);
-        g.setGradientFill(grad);
-        g.fillEllipse(cx - R, cy - R, R * 2, R * 2);
-    }
-    g.setColour(Pal::border);
-    g.drawEllipse(cx - R, cy - R, R * 2, R * 2, 1.5f);
-
-    // ── Hub ──
-    const float hubR = R * 0.22f;
-    g.setColour(Pal::bg);
-    g.fillEllipse(cx - hubR, cy - hubR, hubR * 2, hubR * 2);
-    g.setColour(Pal::knobRim);
-    g.drawEllipse(cx - hubR, cy - hubR, hubR * 2, hubR * 2, 1.5f);
-
-    // ── Spokes ──
-    const int numSpokes = 6;
-    for (int s = 0; s < numSpokes; ++s)
-    {
-        const float a = angle + wobble + s * juce::MathConstants<float>::twoPi / numSpokes;
-        const float x1 = cx + hubR * std::sin(a);
-        const float y1 = cy - hubR * std::cos(a);
-        const float spokeR = R * 0.72f;
-        const float x2 = cx + spokeR * std::sin(a);
-        const float y2 = cy - spokeR * std::cos(a);
-        g.setColour(Pal::reelSpoke.withAlpha(0.7f));
-        g.drawLine(x1, y1, x2, y2, 1.8f);
-
-        // Spoke end dot
-        g.setColour(Pal::knobRim);
-        g.fillEllipse(x2 - 2.5f, y2 - 2.5f, 5.0f, 5.0f);
-    }
-
-    // ── Tape roll ring ──
-    const float tapeOuter = R * 0.92f;
-    const float tapeInner = R * 0.75f;
-    juce::ColourGradient tapeGrad(Pal::tape.withAlpha(0.4f), cx - tapeOuter, cy,
-                                   Pal::tape.withAlpha(0.15f), cx + tapeOuter, cy, true);
-    g.setGradientFill(tapeGrad);
-    g.fillEllipse(cx - tapeOuter, cy - tapeOuter, tapeOuter * 2, tapeOuter * 2);
-    g.setColour(Pal::reel2);
-    g.fillEllipse(cx - tapeInner, cy - tapeInner, tapeInner * 2, tapeInner * 2);
-
-    // ── Centre pin ──
-    g.setColour(Pal::accent.withAlpha(0.8f));
-    g.fillEllipse(cx - 3, cy - 3, 6, 6);
-}
-
-// ═══════════════════════════════════════════════════════════════════
-//  SpeedMeter
-// ═══════════════════════════════════════════════════════════════════
-SpeedMeter::SpeedMeter()
-{
-    startTimerHz(60);
-}
-
-void SpeedMeter::setTargetSpeed(float s) { targetSpeed = s; }
-
-void SpeedMeter::timerCallback()
-{
-    displaySpeed += (targetSpeed - displaySpeed) * 0.08f;
-    repaint();
-}
-
-void SpeedMeter::paint(juce::Graphics& g)
-{
-    const int W = getWidth(), H = getHeight();
-    const float fill = displaySpeed;
-
-    // Background
-    g.setColour(Pal::knobBg);
-    g.fillRoundedRectangle(0, 0, W, H, 4.0f);
-    g.setColour(Pal::border);
-    g.drawRoundedRectangle(0.5f, 0.5f, W - 1, H - 1, 4.0f, 1.0f);
-
-    // Bar
-    const int barW = (int)((W - 4) * fill);
-    if (barW > 0)
-    {
-        juce::ColourGradient grad(Pal::accent, 2, H / 2,
-                                   (fill < 0.5f ? Pal::red : Pal::green), W - 2, H / 2, false);
-        g.setGradientFill(grad);
-        g.fillRoundedRectangle(2, 2, (float)barW, (float)(H - 4), 3.0f);
-    }
-
-    // Speed label
-    g.setFont(juce::Font("Courier New", 10.5f, juce::Font::bold));
-    g.setColour(Pal::textBright);
-    g.drawText(juce::String((int)(fill * 100)) + "%", 0, 0, W, H,
-               juce::Justification::centred);
-}
-
-// ═══════════════════════════════════════════════════════════════════
-//  LabelledKnob
-// ═══════════════════════════════════════════════════════════════════
-LabelledKnob::LabelledKnob(const juce::String& labelText, const juce::String& suffix)
-    : unitSuffix(suffix)
-{
-    slider.setLookAndFeel(&getLAF());
-    slider.setSliderStyle(juce::Slider::Rotary);
-    slider.setTextBoxStyle(juce::Slider::TextBoxBelow, false, 70, 18);
-    slider.setColour(juce::Slider::textBoxTextColourId,       Pal::textBright);
-    slider.setColour(juce::Slider::textBoxBackgroundColourId, Pal::knobBg);
-    slider.setColour(juce::Slider::textBoxOutlineColourId,    Pal::border);
-    slider.setTextValueSuffix(" " + suffix);
-    addAndMakeVisible(slider);
-
-    label.setText(labelText, juce::dontSendNotification);
-    label.setFont(juce::Font("Courier New", 10.0f, juce::Font::bold));
-    label.setColour(juce::Label::textColourId, Pal::textDim);
-    label.setJustificationType(juce::Justification::centred);
-    addAndMakeVisible(label);
-}
-
-void LabelledKnob::resized()
-{
-    auto b = getLocalBounds();
-    label.setBounds(b.removeFromTop(18));
-    slider.setBounds(b);
-}
-
-// ═══════════════════════════════════════════════════════════════════
-//  TapeStopAudioProcessorEditor
-// ═══════════════════════════════════════════════════════════════════
-TapeStopAudioProcessorEditor::TapeStopAudioProcessorEditor(TapeStopAudioProcessor& p)
-    : AudioProcessorEditor(&p), processor(p)
-{
-    setSize(420, 300);
-    setResizable(false, false);
-    lastState = TapeStopAudioProcessor::TapeState::Idle;
-
-    // Knob attachments
-    stopAttach  = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
-                      p.apvts, "stopTime",  stopKnob.slider);
-    startAttach = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
-                      p.apvts, "startTime", startKnob.slider);
-
-    addAndMakeVisible(reel);
-    addAndMakeVisible(speedMeter);
-    addAndMakeVisible(stopKnob);
-    addAndMakeVisible(startKnob);
-    addAndMakeVisible(stopButton);
-    addAndMakeVisible(startButton);
-    addAndMakeVisible(tapButton);
-
-    styleButton(stopButton,  Pal::red);
-    styleButton(startButton, Pal::green);
-    styleButton(tapButton,   Pal::accent);
-
-    stopButton.onClick  = [this] { processor.triggerStop();  };
-    startButton.onClick = [this] { processor.triggerStart(); };
-    tapButton.onClick   = [this] { processor.triggerStopStart(); };
-
-    startTimerHz(30);
-}
-
-TapeStopAudioProcessorEditor::~TapeStopAudioProcessorEditor()
-{
-    stopTimer();
-}
-
-void TapeStopAudioProcessorEditor::styleButton(juce::TextButton& btn, juce::Colour accent)
-{
-    btn.setLookAndFeel(nullptr);
-    btn.setColour(juce::TextButton::buttonColourId,   Pal::panel);
-    btn.setColour(juce::TextButton::buttonOnColourId,  accent.withAlpha(0.3f));
-    btn.setColour(juce::TextButton::textColourOffId,   accent);
-    btn.setColour(juce::TextButton::textColourOnId,    accent.brighter(0.3f));
-    btn.setColour(juce::ComboBox::outlineColourId,     accent.withAlpha(0.5f));
-}
-
-void TapeStopAudioProcessorEditor::timerCallback()
-{
-    const float spd = processor.getCurrentSpeed();
-    reel.setSpeed(spd);
-    speedMeter.setTargetSpeed(spd);
-
-    auto state = processor.getTapeState();
-    const bool isStop = (state == TapeStopAudioProcessor::TapeState::Stopped ||
-                         state == TapeStopAudioProcessor::TapeState::Stopping);
-    stopButton.setToggleState(isStop, juce::dontSendNotification);
-    startButton.setToggleState(state == TapeStopAudioProcessor::TapeState::Starting,
-                               juce::dontSendNotification);
-}
-
-void TapeStopAudioProcessorEditor::drawBackground(juce::Graphics& g)
-{
-    const int W = getWidth(), H = getHeight();
-
-    // Main background
-    g.fillAll(Pal::bg);
-
-    // Subtle vignette
-    {
-        juce::ColourGradient vignette(juce::Colours::transparentBlack, W * 0.5f, H * 0.5f,
-                                      juce::Colour(0x44000000), 0, 0, true);
-        g.setGradientFill(vignette);
-        g.fillRect(0, 0, W, H);
-    }
-
-    // Top header strip
-    {
-        juce::ColourGradient header(Pal::panel.brighter(0.05f), 0, 0,
-                                     Pal::panel, 0, 44, false);
-        g.setGradientFill(header);
-        g.fillRect(0, 0, W, 44);
-    }
-    g.setColour(Pal::border);
-    g.drawLine(0, 44, W, 44, 1.0f);
-
-    // Accent top edge
-    g.setColour(Pal::accent);
-    g.fillRect(0, 0, W, 2);
-
-    // Title
-    g.setFont(juce::Font("Courier New", 15.0f, juce::Font::bold));
-    g.setColour(Pal::textBright);
-    g.drawText("TAPE STOP PRO", 16, 0, 240, 44, juce::Justification::centredLeft);
-
-    // Subtitle
-    g.setFont(juce::Font("Courier New", 9.0f, juce::Font::plain));
-    g.setColour(Pal::textDim);
-    g.drawText("PITCH RAMP  //  5000ms", 16, 24, 240, 18, juce::Justification::centredLeft);
-
-    // Right tag
-    g.setFont(juce::Font("Courier New", 9.0f, juce::Font::bold));
-    g.setColour(Pal::accentDim);
-    g.drawText("v1.0", W - 40, 0, 36, 44, juce::Justification::centredRight);
-
-    // Panel for reel
-    g.setColour(Pal::panel);
-    g.fillRoundedRectangle(12, 52, 130, 130, 8.0f);
-    g.setColour(Pal::border);
-    g.drawRoundedRectangle(12, 52, 130, 130, 8.0f, 1.0f);
-
-    // Speed label
-    g.setFont(juce::Font("Courier New", 9.0f, juce::Font::bold));
-    g.setColour(Pal::textDim);
-    g.drawText("SPEED", 12, 186, 130, 16, juce::Justification::centred);
-
-    // Divider
-    g.setColour(Pal::border);
-    g.drawLine(0, 250, W, 250, 1.0f);
-
-    // Bottom strip label
-    g.setFont(juce::Font("Courier New", 9.0f, juce::Font::plain));
-    g.setColour(Pal::textDim);
-    g.drawText("STOP", 110, 254, 70, 18, juce::Justification::centred);
-    g.drawText("START", 200, 254, 70, 18, juce::Justification::centred);
-    g.drawText("TRIGGER", 288, 254, 110, 18, juce::Justification::centred);
-}
-
-void TapeStopAudioProcessorEditor::paint(juce::Graphics& g)
-{
-    drawBackground(g);
-}
-
-void TapeStopAudioProcessorEditor::resized()
-{
-    // Reel
-    reel.setBounds(18, 58, 118, 118);
-
-    // Speed meter
-    speedMeter.setBounds(16, 200, 126, 18);
-
-    // Stop knob
-    stopKnob.setBounds(150, 48, 100, 118);
-
-    // Start knob
-    startKnob.setBounds(268, 48, 100, 118);
-
-    // Buttons row
-    stopButton .setBounds(108, 272, 64, 22);
-    startButton.setBounds(198, 272, 64, 22);
-    tapButton  .setBounds(286, 272, 118, 22);
+    return new TapeStopAudioProcessor();
 }
