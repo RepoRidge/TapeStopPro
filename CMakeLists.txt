@@ -1,9 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 project(TapeStopPro VERSION 1.0.0)
 
-# ── Point this to your JUCE folder ──────────────────────────────────────────
-# Option A: clone JUCE next to this folder → ../JUCE
-# Option B: set JUCE_PATH via command line: cmake .. -DJUCE_PATH=C:/JUCE
 if(NOT DEFINED JUCE_PATH)
     set(JUCE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../JUCE")
 endif()
@@ -13,7 +10,7 @@ add_subdirectory(${JUCE_PATH} JUCE)
 juce_add_plugin(TapeStopPro
     PLUGIN_MANUFACTURER_CODE  Ttsp
     PLUGIN_CODE               Tstp
-    FORMATS                   VST3   # Add AU if building on macOS
+    FORMATS                   VST3
     PRODUCT_NAME              "Tape Stop Pro"
     COMPANY_NAME              "YourName"
     BUNDLE_ID                 com.yourname.tapestoppro
@@ -28,10 +25,10 @@ juce_add_plugin(TapeStopPro
 juce_generate_juce_header(TapeStopPro)
 
 target_sources(TapeStopPro PRIVATE
-    Source/PluginProcessor.cpp
-    Source/PluginProcessor.h
-    Source/PluginEditor.cpp
-    Source/PluginEditor.h
+    PluginProcessor.cpp
+    PluginProcessor.h
+    PluginEditor.cpp
+    PluginEditor.h
 )
 
 target_compile_definitions(TapeStopPro PUBLIC
