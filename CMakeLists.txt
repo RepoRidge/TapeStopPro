@@ -13,7 +13,7 @@ add_subdirectory(${JUCE_PATH} JUCE)
 juce_add_plugin(TapeStopPro
     PLUGIN_MANUFACTURER_CODE  Ttsp
     PLUGIN_CODE               Tstp
-    FORMATS                   VST3 VST   # Add AU if building on macOS
+    FORMATS                   VST3   # Add AU if building on macOS
     PRODUCT_NAME              "Tape Stop Pro"
     COMPANY_NAME              "YourName"
     BUNDLE_ID                 com.yourname.tapestoppro
