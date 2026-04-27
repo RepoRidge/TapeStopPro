@@ -26,7 +26,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout TapeStopAudioProcessor::crea
 
     layout.add(std::make_unique<juce::AudioParameterFloat>(
         "stopTime", "Stop Time",
-        juce::NormalisableRange<float>(10.0f, 5000.0f, 1.0f, 0.4f), // skewed
+        juce::NormalisableRange<float>(10.0f, 5000.0f, 1.0f, 0.4f),
         500.0f, "ms"));
 
     layout.add(std::make_unique<juce::AudioParameterFloat>(
@@ -115,7 +115,6 @@ void TapeStopAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce
 
     for (int i = 0; i < numSamples; ++i)
     {
-        // Always write incoming audio into circular buffer
         int wi = (int)writePos & bufferMask;
         circularBufferL[wi] = inL[i];
         circularBufferR[wi] = hasStereo ? inR[i] : inL[i];
@@ -126,14 +125,12 @@ void TapeStopAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce
 
         if (state == TapeState::Stopping)
         {
-            // Ease-out curve: speed goes from 1 → 0
             double totalSamples = stopTimeSamples > 0 ? stopTimeSamples : 1.0;
             rampProgress += 1.0 / totalSamples;
             if (rampProgress >= 1.0) rampProgress = 1.0;
 
-            // Smooth cubic ease-out
             float t = (float)rampProgress;
-            speed = 1.0f - (t * t * (3.0f - 2.0f * t)); // smoothstep
+            speed = 1.0f - (t * t * (3.0f - 2.0f * t));
             currentSpeed.store(speed);
 
             if (rampProgress >= 1.0)
@@ -149,7 +146,7 @@ void TapeStopAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce
             if (rampProgress >= 1.0) rampProgress = 1.0;
 
             float t = (float)rampProgress;
-            speed = t * t * (3.0f - 2.0f * t); // smoothstep up
+            speed = t * t * (3.0f - 2.0f * t);
             currentSpeed.store(speed);
 
             if (rampProgress >= 1.0)
@@ -157,15 +154,12 @@ void TapeStopAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce
                 tapeState.store(TapeState::Idle);
                 speed = 1.0f;
                 currentSpeed.store(1.0f);
-                // Resync read to write to avoid drift
                 readPos = writePos;
             }
         }
 
-        // Advance read pointer by current speed
         readPos += (double)speed;
 
-        // Keep readPos from drifting too far behind
         double maxDelay = (double)(BUFFER_SIZE / 2);
         if (writePos - readPos > maxDelay)
             readPos = writePos - maxDelay;
@@ -190,6 +184,11 @@ void TapeStopAudioProcessor::setStateInformation(const void* data, int sizeInByt
     std::unique_ptr<juce::XmlElement> xml(getXmlFromBinary(data, sizeInBytes));
     if (xml && xml->hasTagName(apvts.state.getType()))
         apvts.replaceState(juce::ValueTree::fromXml(*xml));
+}
+
+juce::AudioProcessorEditor* TapeStopAudioProcessor::createEditor()
+{
+    return new TapeStopAudioProcessorEditor(*this);
 }
 
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
